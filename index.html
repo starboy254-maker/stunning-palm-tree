@@ -1,0 +1,114 @@
+
+
+
+import os
+import json
+import asyncio
+import random
+import websockets
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from collections import deque
+
+@dataclass
+class Candle:
+    open: float
+    high: float
+    low: float
+    close: float
+    ts: datetime
+
+@dataclass
+class Snapshot:
+    symbol: str
+    price: float
+    candles_5m: list = field(default_factory=list)
+    usd_direction: str = "flat"
+
+class Feed:
+    def __init__(self):
+        self.snapshots = {}
+        self._buffers = {}
+        # Starting prices for our simulation
+        self._sim_prices = {"XAUUSD": 4000.0, "EURUSD": 1.0800, "DXY": 105.0}
+
+    async def stream(self):
+        # ==========================================
+        # OPTION 1: FAKE DATA (Works immediately)
+        # ==========================================
+        print("[Feed] Starting Backend Simulation...")
+        
+        # 1. Pre-fill history so the chart isn't empty
+        now = datetime.utcnow()
+        for i in range(20, 0, -1):
+            ts = now - timedelta(minutes=5 * i)
+            for sym in self._sim_prices:
+                # Create a fake historical tick
+                self._on_tick({"symbol": sym, "price": self._sim_prices[sym], "time": ts.isoformat()})
+                self._sim_prices[sym] *= (1 + random.uniform(-0.002, 0.002))
+
+        # 2. Stream live simulated ticks every 1 second
+        while True:
+            await asyncio.sleep(1)
+            now_ts = datetime.utcnow().isoformat()
+            for sym in self._sim_prices:
+                # Random walk movement
+                self._sim_prices[sym] *= (1 + random.uniform(-0.0005, 0.0005))
+                self._on_tick({"symbol": sym, "price": round(self._sim_prices[sym], 4), "time": now_ts})
+
+        # ==========================================
+        # OPTION 2: REAL DATA (Uncomment when ready)
+        # ==========================================
+        # api_key = os.environ["DATA_API_KEY"]
+        # url = os.environ["DATA_API_URL"]
+        # async with websockets.connect(f"{url}?apiKey={api_key}") as ws:
+        #     await ws.send(json.dumps({
+        #         "action": "subscribe",
+        #         "symbols": ["XAUUSD", "EURUSD", "DXY"]
+        #     }))
+        #     async for raw in ws:
+        #         msg = json.loads(raw)
+        #         # NOTE: You must change these keys to match your provider's format!
+        #         # Example: msg might be {"s": "XAUUSD", "p": 4000.5, "t": 123456789}
+        #         self._on_tick({
+        #             "symbol": msg.get("symbol") or msg.get("s"),
+        #             "price": msg.get("price") or msg.get("p"),
+        #             "time": datetime.utcnow().isoformat() # Or parse msg["t"]
+        #         })
+
+    def _on_tick(self, msg: dict):
+        sym = msg["symbol"]
+        price = float(msg["price"])
+        ts = datetime.fromisoformat(msg["time"])
+        
+        buf = self._buffers.setdefault(sym, deque(maxlen=10000))
+        buf.append((ts, price))
+        self.snapshots[sym] = self._build_snapshot(sym, price, buf)
+
+    def _build_snapshot(self, sym, price, buf):
+        candles = self._aggregate_5m(buf)
+        usd_dir = "flat"
+        if "DXY" in self.snapshots:
+            dxy_candles = self._aggregate_5m(self._buffers.get("DXY", deque()))
+            if len(dxy_candles) >= 2:
+                usd_dir = "up" if dxy_candles[-1].close > dxy_candles[-2].close else "down"
+        
+        # Return the last 30 candles for the chart
+        return Snapshot(symbol=sym, price=price, candles_5m=candles[-30:], usd_direction=usd_dir)
+
+    def _aggregate_5m(self, buf):
+        if not buf:
+            return []
+        candles, bucket, o, h, l, c = [], None, None, None, None, None
+        for ts, price in buf:
+            # Round time down to nearest 5 minutes
+            key = ts.replace(minute=(ts.minute // 5) * 5, second=0, microsecond=0)
+            if bucket is None or key != bucket:
+                if bucket is not None:
+                    candles.append(Candle(o, h, l, c, bucket))
+                bucket, o, h, l, c = key, price, price, price, price
+            else:
+                h, l, c = max(h, price), min(l, price), price
+        if bucket is not None:
+            candles.append(Candle(o, h, l, c, bucket))
+        return candles
